@@ -1,115 +1,114 @@
 import json
 import hashlib
 import os
-import sqlite3
 import threading
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+
+from .database import ConnectionFacade, create_database_engine
+
+
+AUTO_SEND_CONSENT_VERSION = 1
+_SQLITE_LOCKS: dict[str, threading.RLock] = {}
+_SQLITE_LOCKS_GUARD = threading.Lock()
+
+
+def _sqlite_lock_for(engine):
+    key = engine.url.render_as_string(hide_password=False)
+    with _SQLITE_LOCKS_GUARD:
+        return _SQLITE_LOCKS.setdefault(key, threading.RLock())
+
+
+class GmailConnectionRequiredError(Exception):
+    pass
+
+
+class AutoSendKillSwitchActiveError(Exception):
+    pass
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def utc_day_bounds() -> tuple[str, str]:
+    now = datetime.now(timezone.utc)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=1)
+    return start.isoformat(), end.isoformat()
+
+
 class Store:
-    def __init__(self, path: str | Path):
-        self.path = str(path)
-        if self.path != ":memory:":
-            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(self.path, check_same_thread=False, timeout=30)
-        self.connection.row_factory = sqlite3.Row
-        self.lock = threading.RLock()
-        self.connection.execute("PRAGMA foreign_keys = ON")
-        self.connection.execute("PRAGMA busy_timeout = 30000")
-        self.connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS drafts (
-                id TEXT PRIMARY KEY,
-                owner_id TEXT NOT NULL,
-                recipient TEXT NOT NULL,
-                subject TEXT NOT NULL,
-                body TEXT NOT NULL,
-                review_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'draft',
-                approved_hash TEXT,
-                approved_at TEXT,
-                send_attempt_key TEXT,
-                provider_message_id TEXT,
-                sent_at TEXT,
-                send_error TEXT
-            );
-            CREATE INDEX IF NOT EXISTS drafts_owner_created
-                ON drafts(owner_id, created_at DESC);
-            CREATE INDEX IF NOT EXISTS drafts_owner_updated
-                ON drafts(owner_id, updated_at DESC);
-            CREATE TABLE IF NOT EXISTS auth_sessions (
-                session_hash TEXT PRIMARY KEY,
-                owner_id TEXT NOT NULL,
-                expires_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS gmail_connections (
-                owner_id TEXT PRIMARY KEY,
-                credentials_encrypted TEXT NOT NULL,
-                scopes_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                account_email TEXT NOT NULL DEFAULT ''
-            );
-            CREATE TABLE IF NOT EXISTS audit_events (
-                id TEXT PRIMARY KEY,
-                owner_id TEXT NOT NULL,
-                draft_id TEXT,
-                event_type TEXT NOT NULL,
-                details_json TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS audit_draft_created
-                ON audit_events(draft_id, created_at DESC);
-            CREATE TABLE IF NOT EXISTS account_settings (
-                owner_id TEXT PRIMARY KEY,
-                mode TEXT NOT NULL DEFAULT 'approval_required',
-                enabled INTEGER NOT NULL DEFAULT 0,
-                recipient_allowlist_json TEXT NOT NULL DEFAULT '[]',
-                categories_json TEXT NOT NULL DEFAULT '[]',
-                daily_limit INTEGER NOT NULL DEFAULT 5,
-                updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS system_settings (
-                setting_key TEXT PRIMARY KEY,
-                setting_value TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS generation_requests (
-                owner_id TEXT NOT NULL,
-                idempotency_key TEXT NOT NULL,
-                request_hash TEXT NOT NULL,
-                state TEXT NOT NULL,
-                draft_id TEXT,
-                created_at TEXT NOT NULL,
-                PRIMARY KEY(owner_id, idempotency_key)
-            );
-            """
+    def __init__(self, path: str | os.PathLike[str] | None = None, *, engine=None):
+        if engine is None:
+            path_value = os.fspath(path) if path is not None else None
+            if path_value is None or path_value == ":memory:":
+                url = "sqlite:///:memory:"
+            elif "://" in path_value:
+                url = path_value
+            else:
+                from sqlalchemy.engine import URL
+
+                url = URL.create("sqlite", database=path_value).render_as_string(hide_password=False)
+            engine = create_database_engine(url)
+        self.engine = engine
+        self.path = path or str(engine.url)
+        self.connection = ConnectionFacade(engine)
+        self.lock = (
+            _sqlite_lock_for(engine)
+            if engine.dialect.name == "sqlite"
+            else nullcontext()
         )
-        self._migrate_drafts()
-        connection_columns = {
-            row["name"] for row in self.connection.execute("PRAGMA table_info(gmail_connections)").fetchall()
-        }
-        if "account_email" not in connection_columns:
-            self.connection.execute(
-                "ALTER TABLE gmail_connections ADD COLUMN account_email TEXT NOT NULL DEFAULT ''"
-            )
-        self.connection.execute(
-            """INSERT OR IGNORE INTO system_settings (setting_key, setting_value, updated_at)
-            VALUES ('auto_send_kill_switch', ?, ?)""",
-            ("1" if os.getenv("MAILPILOT_AUTO_SEND_KILL_SWITCH", "false").lower() == "true" else "0", utc_now()),
+
+    def dispose(self):
+        self.connection.close()
+        self.engine.dispose()
+
+    @contextmanager
+    def _advisory_lock(self, key: str, *, shared: bool = False):
+        if self.engine.dialect.name != "postgresql":
+            yield
+            return
+        lock_key = int.from_bytes(
+            hashlib.sha256(f"mailpilot:{key}".encode("utf-8")).digest()[:8],
+            byteorder="big",
+            signed=True,
         )
-        self.connection.commit()
+        connection = self.engine.connect().execution_options(isolation_level="AUTOCOMMIT")
+        function = "pg_advisory_lock_shared" if shared else "pg_advisory_lock"
+        unlock = "pg_advisory_unlock_shared" if shared else "pg_advisory_unlock"
+        acquired = False
+        try:
+            connection.exec_driver_sql(f"SELECT {function}(%s)", (lock_key,))
+            acquired = True
+            yield
+        finally:
+            try:
+                if acquired:
+                    try:
+                        connection.exec_driver_sql(f"SELECT {unlock}(%s)", (lock_key,))
+                    except Exception:
+                        connection.invalidate()
+                        raise
+            finally:
+                connection.close()
+
+    @contextmanager
+    def _owner_lock(self, owner_id: str):
+        with self._advisory_lock(f"owner:{owner_id}"):
+            yield
+
+    @contextmanager
+    def _session_lock(self, session_hash: str | None):
+        if session_hash:
+            with self._advisory_lock(f"session:{session_hash}"):
+                yield
+        else:
+            yield
 
     def claim_generation(self, owner_id: str, key: str, request_hash: str):
-        with self.lock:
+        with self.lock, self._owner_lock(owner_id):
             self.connection.execute("BEGIN IMMEDIATE")
             row = self.connection.execute(
                 "SELECT * FROM generation_requests WHERE owner_id = ? AND idempotency_key = ?",
@@ -122,11 +121,11 @@ class Store:
                 if row["state"] == "complete" and row["draft_id"]:
                     return "duplicate", self.get_draft(owner_id, row["draft_id"])
                 return "in_progress", None
-            today = utc_now()[:10]
+            start, end = utc_day_bounds()
             count = self.connection.execute(
                 """SELECT COUNT(*) AS count FROM generation_requests
-                WHERE owner_id = ? AND substr(created_at, 1, 10) = ?""",
-                (owner_id, today),
+                WHERE owner_id = ? AND created_at >= ? AND created_at < ?""",
+                (owner_id, start, end),
             ).fetchone()["count"]
             if count >= 50:
                 self._audit(owner_id, "generation_rate_limited", details={"daily_limit": 50})
@@ -148,20 +147,6 @@ class Store:
             )
             self.connection.commit()
 
-    def _migrate_drafts(self):
-        columns = {
-            row["name"] for row in self.connection.execute("PRAGMA table_info(drafts)").fetchall()
-        }
-        additions = {
-            "category": "TEXT NOT NULL DEFAULT 'Professional'",
-            "version": "INTEGER NOT NULL DEFAULT 1",
-            "send_authorization": "TEXT",
-            "policy_json": "TEXT",
-        }
-        for name, declaration in additions.items():
-            if name not in columns:
-                self.connection.execute(f"ALTER TABLE drafts ADD COLUMN {name} {declaration}")
-
     def _audit(self, owner_id: str, event_type: str, draft_id: str | None = None, details=None):
         self.connection.execute(
             "INSERT INTO audit_events VALUES (?, ?, ?, ?, ?, ?)",
@@ -172,7 +157,9 @@ class Store:
         with self.lock:
             expires = (datetime.now(timezone.utc) + timedelta(seconds=max_age_seconds)).isoformat()
             self.connection.execute(
-                "INSERT OR REPLACE INTO auth_sessions VALUES (?, ?, ?)",
+                """INSERT INTO auth_sessions VALUES (?, ?, ?)
+                ON CONFLICT(session_hash) DO UPDATE SET
+                owner_id = excluded.owner_id, expires_at = excluded.expires_at""",
                 (session_hash, owner_id, expires),
             )
             self.connection.commit()
@@ -191,27 +178,146 @@ class Store:
                 return None
             return row["owner_id"]
 
-    def delete_session(self, session_hash: str):
+    def save_user(self, owner_id: str, email: str):
         with self.lock:
+            now = utc_now()
+            self.connection.execute(
+                """INSERT INTO users (owner_id, email, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(owner_id) DO UPDATE SET
+                    email = excluded.email, updated_at = excluded.updated_at""",
+                (owner_id, email, now, now),
+            )
+            self.connection.commit()
+
+    def get_user(self, owner_id: str):
+        with self.lock:
+            row = self.connection.execute(
+                "SELECT owner_id, email, created_at, updated_at FROM users WHERE owner_id = ?",
+                (owner_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def create_oauth_state(
+        self,
+        state_hash: str,
+        intent: str,
+        owner_id: str | None,
+        session_hash: str | None,
+        max_age_seconds: int = 600,
+    ):
+        with self.lock:
+            expires = (datetime.now(timezone.utc) + timedelta(seconds=max_age_seconds)).isoformat()
+            self.connection.execute(
+                "DELETE FROM oauth_states WHERE expires_at <= ?", (utc_now(),)
+            )
+            self.connection.execute(
+                "INSERT INTO oauth_states VALUES (?, ?, ?, ?, ?)",
+                (state_hash, intent, owner_id, session_hash, expires),
+            )
+            self.connection.commit()
+
+    def oauth_state_intent(self, state_hash: str) -> str | None:
+        with self.lock:
+            row = self.connection.execute(
+                "SELECT intent, expires_at FROM oauth_states WHERE state_hash = ?",
+                (state_hash,),
+            ).fetchone()
+            if not row or row["expires_at"] <= utc_now():
+                return None
+            return row["intent"]
+
+    def consume_oauth_state(
+        self, state_hash: str, intent: str, session_hash: str | None = None
+    ):
+        with self.lock, self._advisory_lock(f"oauth-state:{state_hash}"):
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.connection.execute(
+                    "SELECT * FROM oauth_states WHERE state_hash = ?",
+                    (state_hash,),
+                ).fetchone()
+                live_session = None
+                if intent == "gmail" and session_hash:
+                    live_session = self.connection.execute(
+                        """SELECT owner_id FROM auth_sessions
+                        WHERE session_hash = ? AND expires_at > ?""",
+                        (session_hash, utc_now()),
+                    ).fetchone()
+                if (
+                    not row
+                    or row["intent"] != intent
+                    or row["expires_at"] <= utc_now()
+                    or (
+                        intent == "gmail"
+                        and (
+                            not session_hash
+                            or row["session_hash"] != session_hash
+                            or not row["owner_id"]
+                            or not live_session
+                            or live_session["owner_id"] != row["owner_id"]
+                        )
+                    )
+                ):
+                    self.connection.commit()
+                    return None
+                self.connection.execute(
+                    "DELETE FROM oauth_states WHERE state_hash = ?", (state_hash,)
+                )
+                self.connection.commit()
+                return dict(row)
+            except Exception:
+                if self.connection.in_transaction:
+                    self.connection.rollback()
+                raise
+
+    def delete_session(self, session_hash: str):
+        with self.lock, self._session_lock(session_hash):
             self.connection.execute("DELETE FROM auth_sessions WHERE session_hash = ?", (session_hash,))
             self.connection.commit()
 
     def save_connection(
-        self, owner_id: str, encrypted: str, scopes: list[str], account_email: str = ""
-    ):
-        with self.lock:
-            self.connection.execute(
-                """INSERT INTO gmail_connections
-                (owner_id, credentials_encrypted, scopes_json, updated_at, account_email)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(owner_id) DO UPDATE SET
-                credentials_encrypted = excluded.credentials_encrypted,
-                scopes_json = excluded.scopes_json,
-                updated_at = excluded.updated_at,
-                account_email = excluded.account_email""",
-                (owner_id, encrypted, json.dumps(scopes), utc_now(), account_email),
-            )
-            self.connection.commit()
+        self,
+        owner_id: str,
+        encrypted: str,
+        scopes: list[str],
+        account_email: str = "",
+        session_hash: str | None = None,
+    ) -> bool:
+        with self.lock, self._owner_lock(owner_id), self._session_lock(session_hash):
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                if session_hash:
+                    session = self.connection.execute(
+                        """SELECT owner_id FROM auth_sessions
+                        WHERE session_hash = ? AND expires_at > ?""",
+                        (session_hash, utc_now()),
+                    ).fetchone()
+                    if not session or session["owner_id"] != owner_id:
+                        self.connection.rollback()
+                        return False
+                self.connection.execute(
+                    """INSERT INTO gmail_connections
+                    (owner_id, credentials_encrypted, scopes_json, updated_at, account_email)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(owner_id) DO UPDATE SET
+                    credentials_encrypted = excluded.credentials_encrypted,
+                    scopes_json = excluded.scopes_json,
+                    updated_at = excluded.updated_at,
+                    account_email = excluded.account_email""",
+                    (owner_id, encrypted, json.dumps(scopes), utc_now(), account_email),
+                )
+                self._audit(
+                    owner_id,
+                    "gmail_connected",
+                    details={"send_scope_granted": "https://www.googleapis.com/auth/gmail.send" in scopes},
+                )
+                self.connection.commit()
+                return True
+            except Exception:
+                if self.connection.in_transaction:
+                    self.connection.rollback()
+                raise
 
     def get_connection(self, owner_id: str):
         with self.lock:
@@ -229,10 +335,44 @@ class Store:
                 "account_email": row["account_email"],
             }
 
+    def disconnect_gmail(self, owner_id: str):
+        with self.lock, self._owner_lock(owner_id):
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                now = utc_now()
+                self.connection.execute("DELETE FROM gmail_connections WHERE owner_id = ?", (owner_id,))
+                self.connection.execute(
+                    """INSERT INTO account_settings
+                    (owner_id, mode, enabled, recipient_allowlist_json, categories_json,
+                    daily_limit, consent_version, updated_at)
+                    VALUES (?, 'approval_required', 0, '[]', '[]', 5, 0, ?)
+                    ON CONFLICT(owner_id) DO UPDATE SET
+                    mode = 'approval_required', enabled = 0,
+                    recipient_allowlist_json = '[]', categories_json = '[]',
+                    daily_limit = 5, consent_version = 0, updated_at = excluded.updated_at""",
+                    (owner_id, now),
+                )
+                self._audit(
+                    owner_id,
+                    "auto_send_revoked",
+                    details={"reason": "gmail_disconnected", "consent_cleared": True},
+                )
+                self._audit(
+                    owner_id,
+                    "gmail_disconnected",
+                    details={
+                        "local_connection_removed": True,
+                        "remote_revocation_attempted": False,
+                    },
+                )
+                self.connection.commit()
+            except Exception:
+                if self.connection.in_transaction:
+                    self.connection.rollback()
+                raise
+
     def delete_connection(self, owner_id: str):
-        with self.lock:
-            self.connection.execute("DELETE FROM gmail_connections WHERE owner_id = ?", (owner_id,))
-            self.connection.commit()
+        self.disconnect_gmail(owner_id)
 
     def create_draft(
         self,
@@ -328,8 +468,8 @@ class Store:
     def get_account_settings(self, owner_id: str):
         with self.lock:
             self.connection.execute(
-                """INSERT OR IGNORE INTO account_settings (owner_id, updated_at)
-                VALUES (?, ?)""",
+                """INSERT INTO account_settings (owner_id, updated_at)
+                VALUES (?, ?) ON CONFLICT(owner_id) DO NOTHING""",
                 (owner_id, utc_now()),
             )
             self.connection.commit()
@@ -340,11 +480,15 @@ class Store:
 
     @staticmethod
     def _settings_dict(row):
+        consent_is_current = row["consent_version"] == AUTO_SEND_CONSENT_VERSION
+        enabled = bool(row["enabled"]) and consent_is_current
         return {
-            "mode": row["mode"],
-            "enabled": bool(row["enabled"]),
-            "recipient_allowlist": json.loads(row["recipient_allowlist_json"]),
-            "categories": json.loads(row["categories_json"]),
+            "mode": row["mode"] if enabled else "approval_required",
+            "enabled": enabled,
+            "recipient_allowlist": (
+                json.loads(row["recipient_allowlist_json"]) if consent_is_current else []
+            ),
+            "categories": json.loads(row["categories_json"]) if consent_is_current else [],
             "daily_limit": row["daily_limit"],
             "updated_at": row["updated_at"],
         }
@@ -352,34 +496,60 @@ class Store:
     def save_auto_send_settings(
         self, owner_id: str, recipients: list[str], categories: list[str], daily_limit: int
     ):
-        with self.lock:
-            now = utc_now()
-            self.connection.execute(
-                """INSERT INTO account_settings
-                (owner_id, mode, enabled, recipient_allowlist_json, categories_json, daily_limit, updated_at)
-                VALUES (?, 'auto_send', 1, ?, ?, ?, ?)
-                ON CONFLICT(owner_id) DO UPDATE SET mode = 'auto_send', enabled = 1,
-                recipient_allowlist_json = excluded.recipient_allowlist_json,
-                categories_json = excluded.categories_json, daily_limit = excluded.daily_limit,
-                updated_at = excluded.updated_at""",
-                (owner_id, json.dumps(recipients), json.dumps(categories), daily_limit, now),
-            )
-            self._audit(owner_id, "auto_send_enabled", details={
-                "recipient_count": len(recipients),
-                "categories": categories,
-                "daily_limit": daily_limit,
-            })
-            self.connection.commit()
+        from .gmail import GMAIL_SEND_SCOPE
+
+        with self.lock, self._owner_lock(owner_id):
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection = self.connection.execute(
+                    "SELECT scopes_json FROM gmail_connections WHERE owner_id = ?",
+                    (owner_id,),
+                ).fetchone()
+                if not connection or GMAIL_SEND_SCOPE not in json.loads(connection["scopes_json"]):
+                    raise GmailConnectionRequiredError
+                if self.kill_switch_enabled():
+                    raise AutoSendKillSwitchActiveError
+
+                now = utc_now()
+                self.connection.execute(
+                    """INSERT INTO account_settings
+                    (owner_id, mode, enabled, recipient_allowlist_json, categories_json,
+                    daily_limit, consent_version, updated_at)
+                    VALUES (?, 'auto_send', 1, ?, ?, ?, ?, ?)
+                    ON CONFLICT(owner_id) DO UPDATE SET mode = 'auto_send', enabled = 1,
+                    recipient_allowlist_json = excluded.recipient_allowlist_json,
+                    categories_json = excluded.categories_json, daily_limit = excluded.daily_limit,
+                    consent_version = excluded.consent_version, updated_at = excluded.updated_at""",
+                    (
+                        owner_id,
+                        json.dumps(recipients),
+                        json.dumps(categories),
+                        daily_limit,
+                        AUTO_SEND_CONSENT_VERSION,
+                        now,
+                    ),
+                )
+                self._audit(owner_id, "auto_send_enabled", details={
+                    "recipient_count": len(recipients),
+                    "categories": categories,
+                    "daily_limit": daily_limit,
+                })
+                self.connection.commit()
+            except Exception:
+                if self.connection.in_transaction:
+                    self.connection.rollback()
+                raise
         return self.get_account_settings(owner_id)
 
     def disable_auto_send(self, owner_id: str):
-        with self.lock:
+        with self.lock, self._owner_lock(owner_id):
             self.connection.execute(
-                """INSERT INTO account_settings (owner_id, mode, enabled, updated_at)
-                VALUES (?, 'approval_required', 0, ?)
+                """INSERT INTO account_settings
+                (owner_id, mode, enabled, consent_version, updated_at)
+                VALUES (?, 'approval_required', 0, ?, ?)
                 ON CONFLICT(owner_id) DO UPDATE SET mode = 'approval_required', enabled = 0,
-                updated_at = excluded.updated_at""",
-                (owner_id, utc_now()),
+                consent_version = excluded.consent_version, updated_at = excluded.updated_at""",
+                (owner_id, AUTO_SEND_CONSENT_VERSION, utc_now()),
             )
             self._audit(owner_id, "auto_send_revoked")
             self.connection.commit()
@@ -395,7 +565,7 @@ class Store:
             return bool(row and row["setting_value"] == "1")
 
     def engage_kill_switch(self, owner_id: str):
-        with self.lock:
+        with self.lock, self._advisory_lock("global-send-policy"):
             self.connection.execute(
                 """INSERT INTO system_settings (setting_key, setting_value, updated_at)
                 VALUES ('auto_send_kill_switch', '1', ?)
@@ -406,11 +576,12 @@ class Store:
             self.connection.commit()
 
     def _auto_send_count_today(self, owner_id: str) -> int:
-        today = utc_now()[:10]
+        start, end = utc_day_bounds()
         row = self.connection.execute(
             """SELECT COUNT(*) AS count FROM audit_events
-            WHERE owner_id = ? AND event_type = 'auto_send_reserved' AND substr(created_at, 1, 10) = ?""",
-            (owner_id, today),
+            WHERE owner_id = ? AND event_type = 'auto_send_reserved'
+            AND created_at >= ? AND created_at < ?""",
+            (owner_id, start, end),
         ).fetchone()
         return row["count"]
 
@@ -427,14 +598,12 @@ class Store:
             self.connection.commit()
 
     @contextmanager
-    def send_lock(self):
-        with self.lock:
-            self.connection.execute("BEGIN IMMEDIATE")
-            try:
-                yield
-            finally:
-                if self.connection.in_transaction:
-                    self.connection.commit()
+    def send_lock(self, owner_id: str, *, auto_send: bool = False):
+        with self.lock, ExitStack() as locks:
+            if auto_send:
+                locks.enter_context(self._advisory_lock("global-send-policy", shared=True))
+            locks.enter_context(self._owner_lock(owner_id))
+            yield
 
     def verify_auto_send_before_provider(self, owner_id: str, draft_id: str, expected_version: int):
         from .gmail import GMAIL_SEND_SCOPE
@@ -518,7 +687,7 @@ class Store:
     ):
         from .policy import evaluate_auto_send
 
-        with self.lock:
+        with self.lock, self._owner_lock(owner_id):
             self.connection.execute("BEGIN IMMEDIATE")
             row = self.connection.execute(
                 "SELECT * FROM drafts WHERE id = ? AND owner_id = ?", (draft_id, owner_id)

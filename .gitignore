@@ -5,6 +5,22 @@
 backend/.env
 backend/data/
 
+# Local databases and database journals
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+
+# Local credentials and private keys
+credentials.json
+service-account*.json
+*.pem
+*.key
+*.p12
+*.pfx
+
 # Python
 __pycache__/
 *.py[cod]

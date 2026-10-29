@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: mailpilot-ai
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    preDeployCommand: alembic -c backend/alembic.ini upgrade head
+    envVars:
+      - key: MAILPILOT_ENV
+        value: production
+      - key: MAILPILOT_COOKIE_SECURE
+        value: "true"
+      - key: MAILPILOT_FRONTEND_URL
+        sync: false
+      - key: GOOGLE_REDIRECT_URI
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: MAILPILOT_TOKEN_ENCRYPTION_KEY
+        sync: false

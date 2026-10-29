@@ -285,9 +285,23 @@ export default function App() {
   }
 
   async function disconnectGmail() {
+    const confirmed = window.confirm(
+      "Disconnect Gmail? MailPilot will remove the locally stored connection and clear automatic-sending permission. Reconnecting will require a new opt-in. This does not revoke the Google OAuth grant; revoke that separately in your Google Account settings if needed.",
+    );
+    if (!confirmed) return;
     try {
       await api("/api/auth/gmail", { method: "DELETE" });
+      setAutoSettings((current) => current && ({
+        ...current,
+        mode: "approval_required",
+        enabled: false,
+        recipient_allowlist: [],
+        categories: [],
+        daily_limit: 5,
+        gmail_connected: false,
+      }));
       await refreshAuth();
+      await refreshAutoSettings();
     } catch (requestError) {
       setError(requestError.message);
     }
@@ -377,12 +391,13 @@ export default function App() {
               {auth.gmail_connected ? (
                 <button className="text-button" type="button" onClick={disconnectGmail}>Disconnect</button>
               ) : (
-                <a className="text-button" href="/api/auth/google/start">Connect Gmail</a>
+                <a className="text-button" href="/api/auth/google/connect-gmail">Connect Gmail</a>
               )}
+              {auth.user_email && <span className="private-badge">Signed in as {auth.user_email}</span>}
               <button className="icon-button" type="button" aria-label="Sign out" title="Sign out" onClick={signOut}><LogOut size={17} /></button>
             </>
           ) : authLoaded ? (
-            <a className="connect-button" href="/api/auth/google/start">Sign in with Google</a>
+            <a className="connect-button" href="/api/auth/google/sign-in">Sign in with Google</a>
           ) : <span className="private-badge">Checking account…</span>}
           <button className="icon-button help-button" aria-label="Help" title="Auto-send is off unless you explicitly opt in">
             <CircleHelp size={18} />
@@ -398,7 +413,7 @@ export default function App() {
         </section>
 
         {!auth && authLoaded && (
-          <div className="auth-notice"><ShieldCheck size={17} /><span>Sign in with Google to save drafts and connect Gmail. Auto-send remains off unless you deliberately enable it; otherwise you approve every message.</span><a href="/api/auth/google/start">Sign in</a></div>
+          <div className="auth-notice"><ShieldCheck size={17} /><span>Sign in with Google to save drafts. Gmail is optional and can be connected separately when you want to send messages.</span><a href="/api/auth/google/sign-in">Sign in</a></div>
         )}
 
         {auth && autoSettings && (

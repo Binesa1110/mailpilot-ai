@@ -3,13 +3,17 @@ import json
 import os
 import secrets
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
+from sqlalchemy import text
+from sqlalchemy.engine import make_url
 from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2 import id_token
 from google_auth_oauthlib.flow import Flow
@@ -17,14 +21,24 @@ from openai import OpenAI, OpenAIError
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, TypeAdapter, ValidationError, field_validator
 
 from .gmail import GMAIL_SEND_SCOPE, GmailSendError, GmailSender, create_mime_message
+from .database import database_url
+from .frontend import SpaStaticFiles, frontend_build_directory
 from .policy import SUPPORTED_CATEGORIES, evaluate_auto_send, normalize_email_address
-from .storage import Store
+from .storage import (
+    AutoSendKillSwitchActiveError,
+    GmailConnectionRequiredError,
+    Store,
+)
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 SESSION_COOKIE = "mailpilot_session"
 OAUTH_COOKIE = "mailpilot_oauth_state"
+GMAIL_OAUTH_COOKIE = "mailpilot_gmail_oauth_state"
 SESSION_MAX_AGE = 60 * 60 * 24 * 7
+OAUTH_STATE_MAX_AGE = 600
+IDENTITY_SCOPES = ["openid", "email", "profile"]
+GMAIL_CONNECTION_SCOPES = ["openid", "email", GMAIL_SEND_SCOPE]
 FRONTEND_URL = os.getenv("MAILPILOT_FRONTEND_URL", "http://localhost:5173")
 APP_ENV = os.getenv("MAILPILOT_ENV", "production").lower()
 OAUTH_REDIRECT_URI = os.getenv(
@@ -62,6 +76,79 @@ def _origin_allowed(origin: str | None) -> bool:
     if APP_ENV != "production":
         allowed.update({"http://localhost:5173", "http://127.0.0.1:5173"})
     return bool(origin and origin.rstrip("/") in allowed)
+
+
+def _production_configuration_errors() -> list[str]:
+    required = (
+        "DATABASE_URL",
+        "OPENAI_API_KEY",
+        "GOOGLE_CLIENT_ID",
+        "GOOGLE_CLIENT_SECRET",
+        "GOOGLE_REDIRECT_URI",
+        "MAILPILOT_TOKEN_ENCRYPTION_KEY",
+        "MAILPILOT_FRONTEND_URL",
+    )
+    errors = [f"{name} is required in production." for name in required if not os.getenv(name)]
+
+    frontend = os.getenv("MAILPILOT_FRONTEND_URL", "")
+    callback = os.getenv("GOOGLE_REDIRECT_URI", "")
+    try:
+        frontend_parts = urlsplit(frontend)
+        if (
+            frontend_parts.scheme != "https"
+            or not frontend_parts.hostname
+            or frontend_parts.path not in ("", "/")
+            or frontend_parts.query
+            or frontend_parts.fragment
+            or frontend_parts.username
+            or frontend_parts.password
+        ):
+            errors.append("MAILPILOT_FRONTEND_URL must be an HTTPS origin without a path.")
+    except ValueError:
+        frontend_parts = None
+        errors.append("MAILPILOT_FRONTEND_URL must be a valid HTTPS origin.")
+
+    try:
+        callback_parts = urlsplit(callback)
+        if (
+            callback_parts.scheme != "https"
+            or not callback_parts.hostname
+            or callback_parts.path != "/api/auth/google/callback"
+            or callback_parts.query
+            or callback_parts.fragment
+            or callback_parts.username
+            or callback_parts.password
+        ):
+            errors.append("GOOGLE_REDIRECT_URI must be the HTTPS Google OAuth callback URL.")
+        elif frontend_parts and callback_parts.netloc != frontend_parts.netloc:
+            errors.append("GOOGLE_REDIRECT_URI must use the MAILPILOT_FRONTEND_URL origin.")
+    except ValueError:
+        errors.append("GOOGLE_REDIRECT_URI must be a valid HTTPS callback URL.")
+
+    database = os.getenv("DATABASE_URL", "")
+    try:
+        database_parts = make_url(database)
+        if (
+            database_parts.drivername not in {"postgresql", "postgresql+psycopg"}
+            or not database_parts.host
+            or not database_parts.database
+        ):
+            errors.append("DATABASE_URL must identify the managed PostgreSQL database.")
+    except Exception:
+        errors.append("DATABASE_URL must be a valid PostgreSQL connection URL.")
+
+    encryption_key = os.getenv("MAILPILOT_TOKEN_ENCRYPTION_KEY", "")
+    if encryption_key:
+        try:
+            from cryptography.fernet import Fernet
+
+            Fernet(encryption_key.encode("ascii"))
+        except (ValueError, UnicodeEncodeError):
+            errors.append("MAILPILOT_TOKEN_ENCRYPTION_KEY must be a valid Fernet key.")
+
+    if not frontend_build_directory().is_dir() or not (frontend_build_directory() / "index.html").is_file():
+        errors.append("Build the frontend so frontend/dist/index.html exists.")
+    return errors
 
 
 class EmailRequest(BaseModel):
@@ -264,7 +351,7 @@ def _content_hash(recipient: str, subject: str, body: str, version: int) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-def _oauth_flow(state: str | None = None) -> Flow:
+def _oauth_flow(state: str | None = None, intent: str = "sign_in") -> Flow:
     client_id = os.getenv("GOOGLE_CLIENT_ID")
     client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
     if not client_id or not client_secret:
@@ -281,13 +368,39 @@ def _oauth_flow(state: str | None = None) -> Flow:
                 "token_uri": "https://oauth2.googleapis.com/token",
             }
         },
-        scopes=["openid", "email", "profile", GMAIL_SEND_SCOPE],
+        scopes=IDENTITY_SCOPES if intent == "sign_in" else GMAIL_CONNECTION_SCOPES,
         state=state,
         redirect_uri=OAUTH_REDIRECT_URI,
     )
 
 
-app = FastAPI(title="MailPilot AI API", version="2.0.0")
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    store = None
+    try:
+        if APP_ENV == "production":
+            configuration_errors = _production_configuration_errors()
+            if configuration_errors:
+                raise RuntimeError("; ".join(configuration_errors))
+        store = Store(database_url())
+        with store.engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+            connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+    except Exception:
+        if store is not None:
+            store.dispose()
+        raise RuntimeError(
+            "The database is unavailable or migrations are missing. Check DATABASE_URL and run "
+            "`alembic -c backend/alembic.ini upgrade head` before starting MailPilot."
+        ) from None
+    application.state.store = store
+    try:
+        yield
+    finally:
+        store.dispose()
+
+
+app = FastAPI(title="MailPilot AI API", version="2.0.0", lifespan=lifespan)
 allowed_origins = {FRONTEND_URL}
 if APP_ENV != "production":
     allowed_origins.update({"http://localhost:5173", "http://127.0.0.1:5173"})
@@ -298,10 +411,6 @@ app.add_middleware(
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Content-Type", "Idempotency-Key"],
 )
-db_path = os.getenv(
-    "MAILPILOT_DB_PATH", str(Path(__file__).resolve().parents[1] / "data" / "mailpilot.sqlite3")
-)
-app.state.store = Store(db_path)
 app.state.ai_service = EmailAIService()
 app.state.gmail_sender = GmailSender()
 
@@ -383,7 +492,7 @@ def _attempt_auto_send(request: Request, owner_id: str, draft: dict) -> dict:
         }
 
     try:
-        with store.send_lock():
+        with store.send_lock(owner_id, auto_send=True):
             verified = store.verify_auto_send_before_provider(owner_id, draft["id"], draft["version"])
             if not verified:
                 store.finish_send(
@@ -444,24 +553,47 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/api/auth/google/start")
-def google_auth_start():
-    flow = _oauth_flow()
+def _start_google_oauth(request: Request, intent: str, owner_id: str | None = None):
+    flow = _oauth_flow(intent=intent)
     authorization_url, state = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="false",
         prompt="consent",
     )
+    session = request.cookies.get(SESSION_COOKIE)
+    if intent == "gmail" and (not owner_id or not session):
+        raise HTTPException(status_code=401, detail="Sign in before connecting Gmail.")
+    cookie_name = GMAIL_OAUTH_COOKIE if intent == "gmail" else OAUTH_COOKIE
+    request.app.state.store.create_oauth_state(
+        _session_hash(state),
+        intent,
+        owner_id,
+        _session_hash(session) if intent == "gmail" and session else None,
+        OAUTH_STATE_MAX_AGE,
+    )
     redirect = RedirectResponse(authorization_url, status_code=302)
     redirect.set_cookie(
-        OAUTH_COOKIE,
+        cookie_name,
         state,
-        max_age=600,
+        max_age=OAUTH_STATE_MAX_AGE,
         httponly=True,
         secure=_secure_cookies(),
         samesite="lax",
     )
     return redirect
+
+
+@app.get("/api/auth/google/start")
+@app.get("/api/auth/google/sign-in")
+def google_auth_start(request: Request):
+    return _start_google_oauth(request, "sign_in")
+
+
+@app.get("/api/auth/google/connect-gmail")
+def google_gmail_connect_start(
+    request: Request, owner_id: str = Depends(authenticated_owner)
+):
+    return _start_google_oauth(request, "gmail", owner_id)
 
 
 @app.get("/api/auth/google/callback")
@@ -470,67 +602,100 @@ def google_auth_callback(
     code: str | None = None,
     state: str | None = None,
     error: str | None = None,
-    mailpilot_oauth_state: str | None = Cookie(default=None, alias=OAUTH_COOKIE),
 ):
-    if error or not code or not state or not mailpilot_oauth_state or not secrets.compare_digest(
-        state, mailpilot_oauth_state
-    ):
+    if not state:
         raise HTTPException(status_code=400, detail="Google sign-in was not completed; try again.")
-    encryption_key = os.getenv("MAILPILOT_TOKEN_ENCRYPTION_KEY")
-    if not encryption_key:
-        raise HTTPException(
-            status_code=503,
-            detail="Set MAILPILOT_TOKEN_ENCRYPTION_KEY before connecting Gmail.",
-        )
+    store = request.app.state.store
+    intent = store.oauth_state_intent(_session_hash(state))
+    if intent not in {"sign_in", "gmail"}:
+        raise HTTPException(status_code=400, detail="Google sign-in was not completed; try again.")
+    cookie_name = GMAIL_OAUTH_COOKIE if intent == "gmail" else OAUTH_COOKIE
+    oauth_cookie = request.cookies.get(cookie_name)
+    if not oauth_cookie or not secrets.compare_digest(state, oauth_cookie):
+        raise HTTPException(status_code=400, detail="Google sign-in was not completed; try again.")
+    current_session = request.cookies.get(SESSION_COOKIE)
+    consumed = store.consume_oauth_state(
+        _session_hash(state),
+        intent,
+        _session_hash(current_session) if current_session else None,
+    )
+    if not consumed:
+        raise HTTPException(status_code=400, detail="Google sign-in was not completed; try again.")
+    if error or not code:
+        raise HTTPException(status_code=400, detail="Google sign-in was not completed; try again.")
+
     try:
-        flow = _oauth_flow(state=state)
+        flow = _oauth_flow(state=state, intent=intent)
         flow.fetch_token(code=code)
         credentials = flow.credentials
-        if not credentials.has_scopes([GMAIL_SEND_SCOPE]):
+        if intent == "sign_in" and not credentials.has_scopes(IDENTITY_SCOPES):
+            raise HTTPException(status_code=403, detail="Google identity permissions were not granted.")
+        if intent == "gmail" and not credentials.has_scopes([GMAIL_SEND_SCOPE]):
             raise HTTPException(status_code=403, detail="Gmail send permission was not granted.")
         identity = id_token.verify_oauth2_token(
             credentials.id_token, GoogleRequest(), os.getenv("GOOGLE_CLIENT_ID")
         )
         try:
-            owner_id = _owner_id_from_identity(identity)
+            identity_owner = _owner_id_from_identity(identity)
         except ValueError as exc:
             raise HTTPException(status_code=403, detail="Google did not provide a verified stable identity.") from exc
         account_email = identity["email"].strip().lower()
-        from cryptography.fernet import Fernet
+        if intent == "gmail":
+            encryption_key = os.getenv("MAILPILOT_TOKEN_ENCRYPTION_KEY")
+            if not encryption_key:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Set MAILPILOT_TOKEN_ENCRYPTION_KEY before connecting Gmail.",
+                )
+            from cryptography.fernet import Fernet
 
-        encrypted = Fernet(encryption_key.encode("ascii")).encrypt(credentials.to_json().encode("utf-8"))
+            encrypted = Fernet(encryption_key.encode("ascii")).encrypt(
+                credentials.to_json().encode("utf-8")
+            )
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail="Google sign-in failed. Please try again.") from exc
 
-    raw_session = secrets.token_urlsafe(32)
-    request.app.state.store.save_connection(
-        owner_id,
-        encrypted.decode("ascii"),
-        credentials.scopes or [],
-        account_email,
-    )
-    request.app.state.store.create_session(_session_hash(raw_session), owner_id, SESSION_MAX_AGE)
-    redirect = RedirectResponse(FRONTEND_URL, status_code=303)
-    redirect.set_cookie(
-        SESSION_COOKIE,
-        raw_session,
-        max_age=SESSION_MAX_AGE,
-        httponly=True,
-        secure=_secure_cookies(),
-        samesite="lax",
-    )
-    redirect.delete_cookie(OAUTH_COOKIE)
+    if intent == "sign_in":
+        store.save_user(identity_owner, account_email)
+        raw_session = secrets.token_urlsafe(32)
+        store.create_session(_session_hash(raw_session), identity_owner, SESSION_MAX_AGE)
+        redirect = RedirectResponse(FRONTEND_URL, status_code=303)
+        redirect.set_cookie(
+            SESSION_COOKIE,
+            raw_session,
+            max_age=SESSION_MAX_AGE,
+            httponly=True,
+            secure=_secure_cookies(),
+            samesite="lax",
+        )
+    else:
+        connected = store.save_connection(
+            consumed["owner_id"],
+            encrypted.decode("ascii"),
+            credentials.scopes or [],
+            account_email,
+            session_hash=consumed["session_hash"],
+        )
+        if not connected:
+            raise HTTPException(
+                status_code=400,
+                detail="Your sign-in session changed or expired. Sign in and connect Gmail again.",
+            )
+        redirect = RedirectResponse(FRONTEND_URL, status_code=303)
+    redirect.delete_cookie(cookie_name)
     return redirect
 
 
 @app.get("/api/auth/session")
 def auth_session(request: Request, owner_id: str = Depends(authenticated_owner)):
     connection = request.app.state.store.get_connection(owner_id)
+    user = request.app.state.store.get_user(owner_id)
     return {
         "owner_id": owner_id,
         "account_email": connection["account_email"] if connection else "",
+        "user_email": user["email"] if user else "",
         "gmail_connected": bool(connection and GMAIL_SEND_SCOPE in connection["scopes"]),
     }
 
@@ -549,8 +714,12 @@ def logout(
 
 @app.delete("/api/auth/gmail")
 def disconnect_gmail(request: Request, owner_id: str = Depends(authenticated_owner)):
-    request.app.state.store.delete_connection(owner_id)
-    return {"status": "disconnected"}
+    request.app.state.store.disconnect_gmail(owner_id)
+    return {
+        "status": "disconnected",
+        "auto_send_consent_cleared": True,
+        "remote_revocation_attempted": False,
+    }
 
 
 @app.get("/api/settings/auto-send")
@@ -576,17 +745,23 @@ def enable_auto_send(
     owner_id: str = Depends(authenticated_owner),
 ):
     store = request.app.state.store
-    connection = store.get_connection(owner_id)
-    if not connection or GMAIL_SEND_SCOPE not in connection["scopes"]:
-        raise HTTPException(status_code=409, detail="Connect Gmail with send permission before enabling auto-send.")
-    if store.kill_switch_enabled():
-        raise HTTPException(status_code=409, detail="The global auto-send kill switch is active.")
-    settings = store.save_auto_send_settings(
-        owner_id,
-        payload.recipient_allowlist,
-        payload.categories,
-        payload.daily_limit,
-    )
+    try:
+        settings = store.save_auto_send_settings(
+            owner_id,
+            payload.recipient_allowlist,
+            payload.categories,
+            payload.daily_limit,
+        )
+    except GmailConnectionRequiredError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="Connect Gmail with send permission before enabling auto-send.",
+        ) from exc
+    except AutoSendKillSwitchActiveError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="The global auto-send kill switch is active.",
+        ) from exc
     return {
         **settings,
         "kill_switch_enabled": store.kill_switch_enabled(),
@@ -768,7 +943,7 @@ def send_draft(
     if state == "uncertain":
         raise HTTPException(status_code=409, detail="The prior send outcome is uncertain. Check Gmail; automatic retry is disabled.")
     try:
-        with store.send_lock():
+        with store.send_lock(owner_id):
             verified = store.verify_manual_send_before_provider(
                 owner_id,
                 draft_id,
@@ -820,3 +995,15 @@ def send_draft(
         "send_authorization": "manual_approval",
         "policy_decision": None,
     }
+
+
+if APP_ENV == "production":
+    app.mount(
+        "/",
+        SpaStaticFiles(
+            directory=str(frontend_build_directory()),
+            html=True,
+            check_dir=False,
+        ),
+        name="frontend",
+    )
